@@ -23,7 +23,7 @@ A Python library for collecting and archiving posts from the Bluesky social netw
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/bluesky-firehose-archiver.git
+git clone https://github.com/joaopn/bluesky-firehose-py.git
 ```
 
 2. Navigate to the project directory:
