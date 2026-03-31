@@ -251,8 +251,8 @@ class BlueskyArchiver:
                             continue
 
                         commit = data.get("commit", {})
-                        if commit.get("operation") != "create":
-                            continue
+                        # if commit.get("operation") != "create":
+                        #     continue
 
                         # Check if it's a post
                         is_post = commit.get("collection") == "app.bsky.feed.post"
@@ -268,6 +268,7 @@ class BlueskyArchiver:
                                 did = data.get("did")
                                 post_record = {
                                     "handle": None,
+                                    "operation": commit.get("operation"),
                                     "record": commit.get("record"),
                                     "rkey": commit.get("rkey"),
                                     "did": did,
