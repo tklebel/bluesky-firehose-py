@@ -1,7 +1,7 @@
 import websockets
 import asyncio
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 import os
 from atproto import Client
 from typing import Dict, Optional, List, AsyncGenerator
@@ -107,7 +107,7 @@ class BlueskyArchiver:
         if self.archive_all or self.archive_non_posts:
             # Save raw records in data_everything directory
             for record in posts:
-                post_time = datetime.fromtimestamp(record["time_us"] / 1_000_000)
+                post_time = datetime.fromtimestamp(record["time_us"] / 1_000_000, tz=timezone.utc)
                 date_dir = post_time.strftime("%Y-%m/%d")
                 hour_filename = post_time.strftime("records_%Y%m%d_%H.jsonl")
 
@@ -144,7 +144,7 @@ class BlueskyArchiver:
 
         posts_by_hour = {}
         for post in posts:
-            post_time = datetime.fromtimestamp(post["time_us"] / 1_000_000)
+            post_time = datetime.fromtimestamp(post["time_us"] / 1_000_000, tz=timezone.utc)
             date_dir = post_time.strftime("%Y-%m/%d")
             operation = post.get("operation", "create")
             if operation == "create":
