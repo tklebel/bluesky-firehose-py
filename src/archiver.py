@@ -146,7 +146,11 @@ class BlueskyArchiver:
         for post in posts:
             post_time = datetime.fromtimestamp(post["time_us"] / 1_000_000)
             date_dir = post_time.strftime("%Y-%m/%d")
-            hour_filename = post_time.strftime("posts_%Y%m%d_%H.jsonl")
+            operation = post.get("operation", "create")
+            if operation == "create":
+                hour_filename = post_time.strftime("posts_%Y%m%d_%H.jsonl")
+            else:
+                hour_filename = post_time.strftime("post_updates_%Y%m%d_%H.jsonl")
             full_path = f"data/{date_dir}/{hour_filename}"
 
             posts_by_hour.setdefault(full_path, []).append(post)
@@ -251,8 +255,6 @@ class BlueskyArchiver:
                             continue
 
                         commit = data.get("commit", {})
-                        # if commit.get("operation") != "create":
-                        #     continue
 
                         # Check if it's a post
                         is_post = commit.get("collection") == "app.bsky.feed.post"
