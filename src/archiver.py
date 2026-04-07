@@ -109,7 +109,10 @@ class BlueskyArchiver:
             for record in posts:
                 post_time = datetime.fromtimestamp(record["time_us"] / 1_000_000, tz=timezone.utc)
                 date_dir = post_time.strftime("%Y-%m/%d")
-                hour_filename = post_time.strftime("records_%Y%m%d_%H.jsonl")
+                if record.get("kind") in ("identity", "account"):
+                    hour_filename = post_time.strftime("lifecycle_%Y%m%d_%H.jsonl")
+                else:
+                    hour_filename = post_time.strftime("records_%Y%m%d_%H.jsonl")
 
                 # Determine the output directory based on mode
                 if self.archive_all:
@@ -193,6 +196,12 @@ class BlueskyArchiver:
         while self.running:
             try:
                 posts = await self.raw_queue.get()
+                # Lifecycle events (identity/account) carry no post-shaped
+                # payload and must skip handle resolution entirely.
+                if posts and posts[0].get("kind") in ("identity", "account"):
+                    await self.processed_queue.put(posts)
+                    self.raw_queue.task_done()
+                    continue
                 if self.get_handles:
                     # Process all posts in parallel
                     tasks = []
@@ -251,7 +260,21 @@ class BlueskyArchiver:
                             break
                         data = json.loads(message)
 
-                        if data.get("kind") != "commit":
+                        # Advance cursor for every message we parse, regardless
+                        # of kind, so a reconnect doesn't replay lifecycle
+                        # events that were already saved.
+                        self.cursor = data.get("time_us")
+
+                        kind = data.get("kind")
+
+                        # Lifecycle events (identity / account) are only
+                        # captured when archiving the broader stream.
+                        if kind in ("identity", "account"):
+                            if self.archive_all or self.archive_non_posts:
+                                await self.raw_queue.put([data])
+                            continue
+
+                        if kind != "commit":
                             continue
 
                         commit = data.get("commit", {})
@@ -277,8 +300,6 @@ class BlueskyArchiver:
                                     "time_us": data.get("time_us"),
                                 }
                                 await self.raw_queue.put([post_record])
-
-                        self.cursor = data.get("time_us")
 
                         if (
                             self.stream
