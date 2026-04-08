@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # Posts archiver (equivalent to: python src/main.py --measure-rate >> data/measured_rate.log 2>&1)
   bluesky-posts:

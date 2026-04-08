@@ -1,7 +1,7 @@
 import websockets
 import asyncio
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 import os
 from atproto import Client
 from typing import Dict, Optional, List, AsyncGenerator
@@ -107,9 +107,12 @@ class BlueskyArchiver:
         if self.archive_all or self.archive_non_posts:
             # Save raw records in data_everything directory
             for record in posts:
-                post_time = datetime.fromtimestamp(record["time_us"] / 1_000_000)
+                post_time = datetime.fromtimestamp(record["time_us"] / 1_000_000, tz=timezone.utc)
                 date_dir = post_time.strftime("%Y-%m/%d")
-                hour_filename = post_time.strftime("records_%Y%m%d_%H.jsonl")
+                if record.get("kind") in ("identity", "account"):
+                    hour_filename = post_time.strftime("lifecycle_%Y%m%d_%H.jsonl")
+                else:
+                    hour_filename = post_time.strftime("records_%Y%m%d_%H.jsonl")
 
                 # Determine the output directory based on mode
                 if self.archive_all:
@@ -144,9 +147,13 @@ class BlueskyArchiver:
 
         posts_by_hour = {}
         for post in posts:
-            post_time = datetime.fromtimestamp(post["time_us"] / 1_000_000)
+            post_time = datetime.fromtimestamp(post["time_us"] / 1_000_000, tz=timezone.utc)
             date_dir = post_time.strftime("%Y-%m/%d")
-            hour_filename = post_time.strftime("posts_%Y%m%d_%H.jsonl")
+            operation = post.get("operation", "create")
+            if operation == "create":
+                hour_filename = post_time.strftime("posts_%Y%m%d_%H.jsonl")
+            else:
+                hour_filename = post_time.strftime("post_updates_%Y%m%d_%H.jsonl")
             full_path = f"data/{date_dir}/{hour_filename}"
 
             posts_by_hour.setdefault(full_path, []).append(post)
@@ -189,6 +196,12 @@ class BlueskyArchiver:
         while self.running:
             try:
                 posts = await self.raw_queue.get()
+                # Lifecycle events (identity/account) carry no post-shaped
+                # payload and must skip handle resolution entirely.
+                if posts and posts[0].get("kind") in ("identity", "account"):
+                    await self.processed_queue.put(posts)
+                    self.raw_queue.task_done()
+                    continue
                 if self.get_handles:
                     # Process all posts in parallel
                     tasks = []
@@ -247,12 +260,24 @@ class BlueskyArchiver:
                             break
                         data = json.loads(message)
 
-                        if data.get("kind") != "commit":
+                        # Advance cursor for every message we parse, regardless
+                        # of kind, so a reconnect doesn't replay lifecycle
+                        # events that were already saved.
+                        self.cursor = data.get("time_us")
+
+                        kind = data.get("kind")
+
+                        # Lifecycle events (identity / account) are only
+                        # captured when archiving the broader stream.
+                        if kind in ("identity", "account"):
+                            if self.archive_all or self.archive_non_posts:
+                                await self.raw_queue.put([data])
+                            continue
+
+                        if kind != "commit":
                             continue
 
                         commit = data.get("commit", {})
-                        if commit.get("operation") != "create":
-                            continue
 
                         # Check if it's a post
                         is_post = commit.get("collection") == "app.bsky.feed.post"
@@ -268,14 +293,13 @@ class BlueskyArchiver:
                                 did = data.get("did")
                                 post_record = {
                                     "handle": None,
+                                    "operation": commit.get("operation"),
                                     "record": commit.get("record"),
                                     "rkey": commit.get("rkey"),
                                     "did": did,
                                     "time_us": data.get("time_us"),
                                 }
                                 await self.raw_queue.put([post_record])
-
-                        self.cursor = data.get("time_us")
 
                         if (
                             self.stream
