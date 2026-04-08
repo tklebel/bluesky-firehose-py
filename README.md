@@ -9,9 +9,10 @@ A Python library for collecting and archiving posts from the Bluesky social netw
   - Posts only (default)
   - All records (posts, likes, follows, etc.)
   - Non-posts only (everything except posts)
-- Archives data in JSONL format, organized by date and hour
+- Archives data in zstd-compressed JSONL format (`.jsonl.zst`), organized by date and hour
 - Optional real-time post text streaming to stdout
 - Automatic reconnection on connection loss
+- Crash-safe resume: persists a per-mode cursor on every flush so a restart picks up where it left off
 - Efficient batch processing and disk operations
 - Debug mode for detailed logging
 - Optional handle resolution (disabled by default)
@@ -74,7 +75,8 @@ python src/main.py
 ```
 - Archives only posts (`app.bsky.feed.post` records)
 - Saves to `data/` directory
-- Files named `posts_YYYYMMDD_HH.jsonl`
+- Files named `posts_YYYYMMDD_HH.jsonl.zst` for new posts, plus `post_updates_YYYYMMDD_HH.jsonl.zst` for deletes/updates
+- Filenames use UTC, so paths are consistent between local and Docker runs
 
 2. **All Records**:
 ```bash
@@ -82,7 +84,7 @@ python src/main.py --archive-all
 ```
 - Archives all record types (posts, likes, follows, etc.)
 - Saves to `data_everything/` directory
-- Files named `records_YYYYMMDD_HH.jsonl`
+- Files named `records_YYYYMMDD_HH.jsonl.zst` (and `lifecycle_YYYYMMDD_HH.jsonl.zst` for identity/account events)
 - Preserves complete record structure
 
 3. **Non-Posts Only**:
@@ -91,7 +93,7 @@ python src/main.py --archive-non-posts
 ```
 - Archives everything except posts
 - Saves to `data_non_posts/` directory
-- Files named `records_YYYYMMDD_HH.jsonl`
+- Files named `records_YYYYMMDD_HH.jsonl.zst` (and `lifecycle_YYYYMMDD_HH.jsonl.zst` for identity/account events)
 - Useful for collecting only interactions and profile updates
 
 Note: The `--archive-all` and `--archive-non-posts` modes cannot be used simultaneously.
@@ -108,7 +110,9 @@ Options:
   --stream          Stream post text to stdout in real-time
   --measure-rate    Track and display posts per minute rate
   --get-handles     Resolve handles while archiving (not recommended)
-  --cursor          Unix microseconds timestamp to start playback from
+  --cursor          Unix microseconds timestamp to start playback from.
+                    Overrides the auto-resume cursor file (default: resume
+                    from <data-dir>/.cursor if present, else live tip)
 ```
 
 ### Library Usage
@@ -142,23 +146,24 @@ if __name__ == "__main__":
 
 ## Data Storage
 
-Records are saved in JSONL (JSON Lines) format, organized by date and hour in different directories based on the archiving mode:
+Records are saved as zstd-compressed JSONL (`.jsonl.zst`), organized by date and hour in different directories based on the archiving mode. Each file is a concatenation of independent zstd frames (one per disk batch), so standard zstd decoders read it as a single stream (`zstdcat file.jsonl.zst | jq .`). Each base dir also contains a hidden `.cursor` file used for crash-safe resume.
 
 ```
 data/                      # Posts only mode (default)
   └── YYYY-MM/
       └── DD/
-          └── posts_YYYYMMDD_HH.jsonl
+          ├── posts_YYYYMMDD_HH.jsonl.zst         # creates
+          └── post_updates_YYYYMMDD_HH.jsonl.zst  # deletes / updates
 
 data_everything/          # Archive all mode
   └── YYYY-MM/
       └── DD/
-          └── records_YYYYMMDD_HH.jsonl
+          └── records_YYYYMMDD_HH.jsonl.zst
 
 data_non_posts/          # Non-posts mode
   └── YYYY-MM/
       └── DD/
-          └── records_YYYYMMDD_HH.jsonl
+          └── records_YYYYMMDD_HH.jsonl.zst
 ```
 
 ### Record Format
@@ -194,25 +199,43 @@ data_non_posts/          # Non-posts mode
 }
 ```
 
-### Playback Support
+### Playback & Crash-Safe Resume
 
-You can start archiving from a specific point in time using the cursor functionality:
+By default the archiver picks up where the previous run left off. After every successful disk flush it writes the maximum `time_us` of that batch to a per-mode cursor file:
+
+- `data/.cursor` (posts mode)
+- `data_non_posts/.cursor` (`--archive-non-posts`)
+- `data_everything/.cursor` (`--archive-all`)
+
+On startup, if no explicit `--cursor` was passed, the archiver reads this file and resumes from that timestamp. Because the cursor is written from the *post-flush* side, a crash (kill -9, OOM, container restart) replays at most one disk-batch window (~10s) — Jetstream serves the replay and downstream dedup on `time_us` collapses it.
+
+To override (e.g. first-time bootstrap, or to backfill from a known point), pass `--cursor` explicitly:
 
 ```bash
 python src/main.py --cursor 1725911162329308
 ```
 
-The cursor should be a Unix timestamp in microseconds. Playback will start from the specified time and continue to real-time. You can find timestamps in the saved records' `time_us` field.
+The cursor is a Unix timestamp in microseconds — find one in any saved record's `time_us` field. Explicit `--cursor` always wins over the persisted file.
+
+To verify resume behavior on captured data, see `interactive_testing/analyze_gaps.py`, which scans a base dir's `.jsonl.zst` files and reports any time_us gaps.
 
 ## Project Structure
 
 ```
 ├── src/
-│   ├── main.py           # Entry point and CLI interface
-│   └── archiver.py       # Core archiving logic
-├── data/                 # Archived posts storage
-├── requirements.txt      # Project dependencies
-└── README.md            # This file
+│   ├── main.py             # Entry point and CLI interface
+│   └── archiver.py         # Core archiving logic
+├── tests/                  # Pytest unit tests (test_archiver.py, test_lifecycle_routing.py)
+├── interactive_testing/    # Manual / exploratory test utilities
+│   └── analyze_gaps.py     # Scan archived .jsonl.zst for time_us gaps (cursor resume validation)
+├── data/                   # Archived posts storage (posts mode)
+├── data_non_posts/         # Archived non-post records (--archive-non-posts)
+├── data_everything/        # Archived everything (--archive-all)
+├── Dockerfile              # Container image definition
+├── docker-compose.yml      # Two-service deployment (bluesky-posts + bluesky-non-posts)
+├── docker-entrypoint.sh    # Container entrypoint
+├── requirements.txt        # Project dependencies
+└── README.md               # This file
 ```
 
 ## License
