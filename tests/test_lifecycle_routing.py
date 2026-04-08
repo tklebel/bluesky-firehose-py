@@ -26,8 +26,8 @@ from src.archiver import BlueskyArchiver
 # paths deterministic.
 TS_US = 1775572272912044
 EXPECTED_DIR = Path("data_non_posts/2026-04/07")
-EXPECTED_LIFECYCLE = EXPECTED_DIR / "lifecycle_20260407_14.jsonl"
-EXPECTED_RECORDS = EXPECTED_DIR / "records_20260407_14.jsonl"
+EXPECTED_LIFECYCLE = EXPECTED_DIR / "lifecycle_20260407_14.jsonl.zst"
+EXPECTED_RECORDS = EXPECTED_DIR / "records_20260407_14.jsonl.zst"
 
 
 def _identity_event():
@@ -75,7 +75,16 @@ def _commit_event():
 
 
 def _read_jsonl(path: Path):
-    return [json.loads(line) for line in path.read_text().splitlines() if line]
+    import zstandard as zstd
+
+    # Files may contain multiple concatenated zstd frames (one per batch
+    # write), so use a streaming reader rather than one-shot decompress.
+    import io
+
+    with open(path, "rb") as fh:
+        reader = zstd.ZstdDecompressor().stream_reader(fh, read_across_frames=True)
+        raw = io.TextIOWrapper(reader, encoding="utf-8").read()
+    return [json.loads(line) for line in raw.splitlines() if line]
 
 
 def _in_tmp_cwd(coro_factory):

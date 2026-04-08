@@ -9,6 +9,35 @@ from asyncio import Queue
 import logging
 import aiofiles
 import sys
+import zstandard as _zstd
+
+# One reusable compressor. ZstdCompressor.compress() is safe to call
+# repeatedly; we only have a single disk worker task today, so no locking
+# is needed.
+_ZSTD_CCTX = _zstd.ZstdCompressor(level=6)
+
+# Disk-write batching. Coalesce records the disk worker pulls off the
+# processed queue so each zstd frame contains a meaningful payload —
+# single-record frames defeat compression entirely.
+DISK_BATCH_MAX_RECORDS = 5000
+DISK_BATCH_WINDOW_S = 10.0
+
+
+async def _append_zst(path: str, lines: List[str]) -> None:
+    """Append a batch of JSONL lines to ``path`` as a single zstd frame.
+
+    A .jsonl.zst file produced this way is a concatenation of independent
+    frames, one per batch. Standard zstd decoders read it as one logical
+    stream. Compression ratio is somewhat worse than a single big frame,
+    but each batch is self-contained, so a crash mid-write can at worst
+    corrupt the trailing frame.
+    """
+    if not lines:
+        return
+    payload = ("\n".join(lines) + "\n").encode("utf-8")
+    frame = _ZSTD_CCTX.compress(payload)
+    async with aiofiles.open(path, "ab") as f:
+        await f.write(frame)
 
 
 class BlueskyArchiver:
@@ -105,26 +134,25 @@ class BlueskyArchiver:
 
         """Asynchronously save posts to JSONL files, organized by hour."""
         if self.archive_all or self.archive_non_posts:
-            # Save raw records in data_everything directory
+            # Group records by destination file so each file is opened and
+            # compressed once per batch instead of once per record.
+            base_dir = "data_everything" if self.archive_all else "data_non_posts"
+            records_by_path: Dict[str, List[str]] = {}
             for record in posts:
                 post_time = datetime.fromtimestamp(record["time_us"] / 1_000_000, tz=timezone.utc)
                 date_dir = post_time.strftime("%Y-%m/%d")
                 if record.get("kind") in ("identity", "account"):
-                    hour_filename = post_time.strftime("lifecycle_%Y%m%d_%H.jsonl")
+                    hour_filename = post_time.strftime("lifecycle_%Y%m%d_%H.jsonl.zst")
                 else:
-                    hour_filename = post_time.strftime("records_%Y%m%d_%H.jsonl")
-
-                # Determine the output directory based on mode
-                if self.archive_all:
-                    base_dir = "data_everything"
-                else:  # archive_non_posts
-                    base_dir = "data_non_posts"
-
+                    hour_filename = post_time.strftime("records_%Y%m%d_%H.jsonl.zst")
                 full_path = f"{base_dir}/{date_dir}/{hour_filename}"
+                records_by_path.setdefault(full_path, []).append(
+                    json.dumps(record, ensure_ascii=False)
+                )
 
+            for full_path, lines in records_by_path.items():
                 os.makedirs(os.path.dirname(full_path), exist_ok=True)
-                async with aiofiles.open(full_path, "a", encoding="utf-8") as f:
-                    await f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                await _append_zst(full_path, lines)
 
             self.posts_saved += len(posts)
 
@@ -151,22 +179,19 @@ class BlueskyArchiver:
             date_dir = post_time.strftime("%Y-%m/%d")
             operation = post.get("operation", "create")
             if operation == "create":
-                hour_filename = post_time.strftime("posts_%Y%m%d_%H.jsonl")
+                hour_filename = post_time.strftime("posts_%Y%m%d_%H.jsonl.zst")
             else:
-                hour_filename = post_time.strftime("post_updates_%Y%m%d_%H.jsonl")
+                hour_filename = post_time.strftime("post_updates_%Y%m%d_%H.jsonl.zst")
             full_path = f"data/{date_dir}/{hour_filename}"
 
             posts_by_hour.setdefault(full_path, []).append(post)
 
         for full_path, hour_posts in posts_by_hour.items():
             os.makedirs(os.path.dirname(full_path), exist_ok=True)
-            async with aiofiles.open(full_path, "a", encoding="utf-8") as f:
-                await f.write(
-                    "\n".join(
-                        json.dumps(post, ensure_ascii=False) for post in hour_posts
-                    )
-                    + "\n"
-                )
+            await _append_zst(
+                full_path,
+                [json.dumps(p, ensure_ascii=False) for p in hour_posts],
+            )
             self.posts_saved += len(hour_posts)
 
         if self.measure_rate:
@@ -230,9 +255,32 @@ class BlueskyArchiver:
         """Background task to handle disk operations."""
         while self.running:
             try:
-                posts = await self.processed_queue.get()
-                await self.save_posts_async(posts)
+                first = await self.processed_queue.get()
+                batch = list(first)
                 self.processed_queue.task_done()
+
+                # Coalesce additional queued records up to a size or
+                # time budget so each zstd frame contains a meaningful
+                # payload instead of one frame per Jetstream message.
+                # On deadline / size hit we break out of the inner loop
+                # and fall through to save_posts_async below — nothing
+                # in `batch` is ever discarded.
+                loop = asyncio.get_event_loop()
+                deadline = loop.time() + DISK_BATCH_WINDOW_S
+                while self.running and len(batch) < DISK_BATCH_MAX_RECORDS:
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        break
+                    try:
+                        more = await asyncio.wait_for(
+                            self.processed_queue.get(), timeout=remaining
+                        )
+                    except asyncio.TimeoutError:
+                        break
+                    batch.extend(more)
+                    self.processed_queue.task_done()
+
+                await self.save_posts_async(batch)
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -263,6 +311,21 @@ class BlueskyArchiver:
                         # Advance cursor for every message we parse, regardless
                         # of kind, so a reconnect doesn't replay lifecycle
                         # events that were already saved.
+                        #
+                        # NOTE for future cursor-persistence work: this
+                        # in-memory cursor lives on the *receive* side, ahead
+                        # of the disk worker. With the 10s batching window
+                        # below (DISK_BATCH_WINDOW_S) up to ~10s of records
+                        # may be queued or sitting in an open batch that has
+                        # not yet been flushed to disk. If a persisted
+                        # resume-cursor is sourced from `self.cursor` and the
+                        # process crashes, those in-flight records would be
+                        # skipped on restart. The persisted cursor must
+                        # instead be derived from the *post-flush* side —
+                        # e.g. the max `time_us` from the most recently
+                        # written batch in `disk_worker`. That guarantees at
+                        # most ~10s of replay (which Jetstream serves and
+                        # downstream dedup collapses), and zero loss.
                         self.cursor = data.get("time_us")
 
                         kind = data.get("kind")
