@@ -44,7 +44,7 @@ def main():
     parser.add_argument("--get-handles", action="store_true",
                        help="Resolve handles while archiving (significantly slower due to rate limits)")
     parser.add_argument("--cursor", type=int,
-                       help="Unix microseconds timestamp to start playback from")
+                       help="Unix microseconds timestamp to start playback from. Overrides the auto-resume cursor file (default: resume from <data-dir>/.cursor if present)")
     parser.add_argument("--archive-all", action="store_true",
                        help="Archive all records in their original format (not just posts)")
     parser.add_argument("--archive-non-posts", action="store_true",

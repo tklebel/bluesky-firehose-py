@@ -104,6 +104,67 @@ class BlueskyArchiver:
         self.archive_all = archive_all
         self.archive_non_posts = archive_non_posts
 
+        # Per-mode cursor file: each mode writes to its own base dir, so
+        # each gets its own resume cursor and they don't clobber each other.
+        if archive_all:
+            self.cursor_file = "data_everything/.cursor"
+        elif archive_non_posts:
+            self.cursor_file = "data_non_posts/.cursor"
+        else:
+            self.cursor_file = "data/.cursor"
+        self._last_persisted_cursor: Optional[int] = None
+
+        # Auto-resume: if no explicit --cursor was passed, try to pick up
+        # where the previous run left off. Explicit cursor always wins.
+        if self.cursor is None:
+            try:
+                with open(self.cursor_file, "r") as f:
+                    persisted = int(f.read().strip())
+                self.cursor = persisted
+                self._last_persisted_cursor = persisted
+                human = datetime.fromtimestamp(
+                    persisted / 1_000_000, tz=timezone.utc
+                ).isoformat()
+                logging.info(
+                    f"Resuming from persisted cursor {persisted} ({human})"
+                )
+            except FileNotFoundError:
+                logging.info(
+                    f"No persisted cursor at {self.cursor_file}, starting at live tip"
+                )
+            except Exception as e:
+                logging.warning(
+                    f"Could not read cursor file {self.cursor_file}: {e}. Starting at live tip"
+                )
+        else:
+            logging.info(f"Using explicit cursor {self.cursor} (overrides any persisted cursor)")
+
+    def _persist_cursor(self, batch: List[dict]) -> None:
+        """Write the max time_us in ``batch`` to the cursor file atomically.
+
+        Called from disk_worker after a successful flush, so the persisted
+        value is always ≤ what is durable on disk. On crash + restart, at
+        most one batch worth of records (~10s) is replayed; Jetstream serves
+        the replay and downstream dedup collapses it.
+        """
+        try:
+            max_us = max(
+                (r["time_us"] for r in batch if isinstance(r.get("time_us"), int)),
+                default=None,
+            )
+            if max_us is None:
+                return
+            if self._last_persisted_cursor is not None and max_us <= self._last_persisted_cursor:
+                return
+            os.makedirs(os.path.dirname(self.cursor_file), exist_ok=True)
+            tmp = f"{self.cursor_file}.tmp"
+            with open(tmp, "w") as f:
+                f.write(str(max_us))
+            os.replace(tmp, self.cursor_file)
+            self._last_persisted_cursor = max_us
+        except Exception as e:
+            logging.error(f"🔴 Failed to persist cursor: {e}")
+
     async def get_handle(self, did: str) -> Optional[str]:
         """Retrieve handle for a given DID."""
         if did in self.handle_cache:
@@ -281,6 +342,7 @@ class BlueskyArchiver:
                     self.processed_queue.task_done()
 
                 await self.save_posts_async(batch)
+                self._persist_cursor(batch)
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -308,24 +370,10 @@ class BlueskyArchiver:
                             break
                         data = json.loads(message)
 
-                        # Advance cursor for every message we parse, regardless
-                        # of kind, so a reconnect doesn't replay lifecycle
-                        # events that were already saved.
-                        #
-                        # NOTE for future cursor-persistence work: this
-                        # in-memory cursor lives on the *receive* side, ahead
-                        # of the disk worker. With the 10s batching window
-                        # below (DISK_BATCH_WINDOW_S) up to ~10s of records
-                        # may be queued or sitting in an open batch that has
-                        # not yet been flushed to disk. If a persisted
-                        # resume-cursor is sourced from `self.cursor` and the
-                        # process crashes, those in-flight records would be
-                        # skipped on restart. The persisted cursor must
-                        # instead be derived from the *post-flush* side —
-                        # e.g. the max `time_us` from the most recently
-                        # written batch in `disk_worker`. That guarantees at
-                        # most ~10s of replay (which Jetstream serves and
-                        # downstream dedup collapses), and zero loss.
+                        # Advance in-memory cursor for in-process reconnects.
+                        # The *persisted* resume cursor is written from the
+                        # post-flush side in disk_worker via _persist_cursor,
+                        # so a crash replays at most one batch (~10s).
                         self.cursor = data.get("time_us")
 
                         kind = data.get("kind")
