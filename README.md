@@ -113,7 +113,17 @@ Options:
   --cursor          Unix microseconds timestamp to start playback from.
                     Overrides the auto-resume cursor file (default: resume
                     from <data-dir>/.cursor if present, else live tip)
+  --jetstream-url   Jetstream websocket endpoint to subscribe to. Overrides
+                    the JETSTREAM_URL env var. Public instances:
+                    wss://jetstream{1,2}.us-{east,west}.bsky.network/subscribe
+                    (default: jetstream2.us-east)
 ```
+
+#### Switching Jetstream instances
+
+You can pick a different Jetstream instance via `--jetstream-url` or the `JETSTREAM_URL` env var (CLI wins). For Docker, set `JETSTREAM_URL` in your shell or a `.env` file next to `docker-compose.yml` — both services pick it up automatically.
+
+Note on cursors when switching: each Jetstream instance stamps events with its *own* `time_us` (the time *that* server received the event from the relay), so timestamps are **not bit-identical** across instances. Cursors are still portable — any instance accepts the `cursor=` query param and replays from its ~24h backlog — but switching mid-stream typically causes a few seconds of replay (or, less commonly, a tiny gap). Our post-flush cursor persistence and downstream `time_us` dedup already tolerate this.
 
 ### Library Usage
 

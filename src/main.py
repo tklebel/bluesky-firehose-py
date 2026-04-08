@@ -15,7 +15,8 @@ async def run_archiver(args):
         get_handles=args.get_handles,
         cursor=args.cursor,
         archive_all=args.archive_all,
-        archive_non_posts=args.archive_non_posts
+        archive_non_posts=args.archive_non_posts,
+        jetstream_url=args.jetstream_url,
     )
     
     def handle_shutdown(sig, frame):
@@ -49,6 +50,17 @@ def main():
                        help="Archive all records in their original format (not just posts)")
     parser.add_argument("--archive-non-posts", action="store_true",
                        help="Archive everything except posts")
+    parser.add_argument("--jetstream-url", type=str, default=None,
+                       help=(
+                           "Jetstream websocket endpoint to subscribe to. "
+                           "Overrides the JETSTREAM_URL env var. "
+                           "Public instances: "
+                           "wss://jetstream1.us-east.bsky.network/subscribe, "
+                           "wss://jetstream2.us-east.bsky.network/subscribe, "
+                           "wss://jetstream1.us-west.bsky.network/subscribe, "
+                           "wss://jetstream2.us-west.bsky.network/subscribe "
+                           "(default: jetstream2.us-east)"
+                       ))
     
     args = parser.parse_args()
     

@@ -52,6 +52,7 @@ class BlueskyArchiver:
         cursor: Optional[int] = None,  # Unix microseconds timestamp
         archive_all: bool = False,  # Flag to archive all records
         archive_non_posts: bool = False,  # Flag to archive everything except posts
+        jetstream_url: Optional[str] = None,
     ):
         """Initialize the Bluesky Archiver."""
         # Configure logging
@@ -79,7 +80,16 @@ class BlueskyArchiver:
         if username and password:
             self.client.login(username, password)
 
-        self.uri = "wss://jetstream2.us-east.bsky.network/subscribe"
+        # Jetstream endpoint precedence: explicit arg → env var → default.
+        # Different Jetstream instances stamp events with their own time_us
+        # (the time *that* server received the event from the relay), so
+        # cursors are portable across instances but not bit-identical —
+        # expect a few seconds of replay when switching.
+        self.uri = (
+            jetstream_url
+            or os.environ.get("JETSTREAM_URL")
+            or "wss://jetstream2.us-east.bsky.network/subscribe"
+        )
         self.handle_cache: Dict[str, str] = {}
         self.resolving_dids: set = set()  # Track DIDs currently being resolved
         self.handle_semaphore = asyncio.Semaphore(
@@ -100,6 +110,7 @@ class BlueskyArchiver:
             level=logging.DEBUG if self.debug else logging.INFO,
             format="%(asctime)s - %(levelname)s - %(message)s",
         )
+        logging.info(f"Using Jetstream endpoint: {self.uri}")
 
         self.archive_all = archive_all
         self.archive_non_posts = archive_non_posts

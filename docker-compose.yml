@@ -4,11 +4,14 @@ services:
     build: .
     container_name: bluesky-posts
     restart: unless-stopped
-      
+
+    environment:
+      JETSTREAM_URL: ${JETSTREAM_URL:-wss://jetstream2.us-east.bsky.network/subscribe}
+
     volumes:
       # Change ./data to your desired host path
       - ./data:/app/data
-    
+
     command: ["python", "src/main.py", "--measure-rate"]
     
     # Redirect logs to file
@@ -23,11 +26,14 @@ services:
     build: .
     container_name: bluesky-non-posts
     restart: unless-stopped
-    
+
+    environment:
+      JETSTREAM_URL: ${JETSTREAM_URL:-wss://jetstream2.us-east.bsky.network/subscribe}
+
     volumes:
       # Change ./data_non_posts to your desired host path
       - ./data_non_posts:/app/data_non_posts
-    
+
     command: ["python", "src/main.py", "--measure-rate", "--archive-non-posts"]
     
     # Redirect logs to file
