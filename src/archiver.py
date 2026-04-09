@@ -361,17 +361,27 @@ class BlueskyArchiver:
 
     async def archive_websocket_listener(self):
         """Continuously listen to the WebSocket and enqueue posts."""
+        # Server-side scope: restrict to Bluesky's namespace. This is the
+        # primary safeguard against incidentally ingesting the hundreds of
+        # unrelated third-party atproto apps that share the firehose.
+        # Posts-only mode narrows further to a single NSID; archive_all /
+        # archive_non_posts use the prefix so new app.bsky.* record types
+        # (e.g. actor.status, notification.declaration) are captured as
+        # Bluesky ships them, without requiring code changes.
+        if self.archive_all or self.archive_non_posts:
+            wanted_collections = ["app.bsky.*"]
+        else:
+            wanted_collections = ["app.bsky.feed.post"]
+
         while self.running:
             try:
-                params = {}  # No filters when archive_all is True
+                query_parts = [f"wantedCollections={c}" for c in wanted_collections]
                 if self.cursor:
                     if self.debug:
                         logging.debug(f"Starting playback from cursor: {self.cursor}")
-                    params["cursor"] = str(self.cursor)
+                    query_parts.append(f"cursor={self.cursor}")
 
-                url = f"{self.uri}"
-                if params:
-                    url += f"?{'&'.join(f'{k}={v}' for k, v in params.items())}"
+                url = f"{self.uri}?{'&'.join(query_parts)}"
 
                 async with websockets.connect(url) as archive_websocket:
                     if self.debug:
@@ -389,8 +399,13 @@ class BlueskyArchiver:
 
                         kind = data.get("kind")
 
-                        # Lifecycle events (identity / account) are only
-                        # captured when archiving the broader stream.
+                        # Lifecycle (identity/account) events are NOT scoped
+                        # by wantedCollections — jetstream sends them for
+                        # every DID on the network regardless of app. We
+                        # keep them in the broader archive modes: they only
+                        # record that *something* changed (handle rotation,
+                        # account takedown) without revealing bio content
+                        # or other plaintext, which is acceptable scope.
                         if kind in ("identity", "account"):
                             if self.archive_all or self.archive_non_posts:
                                 await self.raw_queue.put([data])
@@ -401,8 +416,19 @@ class BlueskyArchiver:
 
                         commit = data.get("commit", {})
 
+                        # Defense-in-depth: if the server ever sends a
+                        # commit outside our requested namespace (protocol
+                        # bug, relay misconfig), drop it loudly instead of
+                        # silently persisting it.
+                        collection = commit.get("collection", "")
+                        if not collection.startswith("app.bsky."):
+                            logging.warning(
+                                f"🔴 Unexpected collection on wire: {collection!r} — dropping"
+                            )
+                            continue
+
                         # Check if it's a post
-                        is_post = commit.get("collection") == "app.bsky.feed.post"
+                        is_post = collection == "app.bsky.feed.post"
 
                         # Handle different archiving modes
                         if self.archive_all:
