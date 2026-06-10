@@ -112,7 +112,7 @@ Options:
   --get-handles     Resolve handles while archiving (not recommended)
   --cursor          Unix microseconds timestamp to start playback from.
                     Overrides the auto-resume cursor file (default: resume
-                    from <data-dir>/.cursor if present, else live tip)
+                    from the per-mode cursor file if present, else live tip)
   --jetstream-url   Jetstream websocket endpoint to subscribe to. Overrides
                     the JETSTREAM_URL env var. Public instances:
                     wss://jetstream{1,2}.us-{east,west}.bsky.network/subscribe
@@ -156,7 +156,7 @@ if __name__ == "__main__":
 
 ## Data Storage
 
-Records are saved as zstd-compressed JSONL (`.jsonl.zst`), organized by date and hour in different directories based on the archiving mode. Each file is a concatenation of independent zstd frames (one per disk batch), so standard zstd decoders read it as a single stream (`zstdcat file.jsonl.zst | jq .`). Each base dir also contains a hidden `.cursor` file used for crash-safe resume.
+Records are saved as zstd-compressed JSONL (`.jsonl.zst`), organized by date and hour in different directories based on the archiving mode. Each file is a concatenation of independent zstd frames (one per disk batch), so standard zstd decoders read it as a single stream (`zstdcat file.jsonl.zst | jq .`). Each base dir also contains a hidden per-mode cursor file (e.g. `.cursor_posts`) used for crash-safe resume.
 
 ```
 data/                      # Posts only mode (default)
@@ -213,9 +213,11 @@ data_non_posts/          # Non-posts mode
 
 By default the archiver picks up where the previous run left off. After every successful disk flush it writes the maximum `time_us` of that batch to a per-mode cursor file:
 
-- `data/.cursor` (posts mode)
-- `data_non_posts/.cursor` (`--archive-non-posts`)
-- `data_everything/.cursor` (`--archive-all`)
+- `data/.cursor_posts` (posts mode)
+- `data_non_posts/.cursor_non_posts` (`--archive-non-posts`)
+- `data_everything/.cursor_everything` (`--archive-all`)
+
+The mode is encoded in the filename (not just the directory), so cursors stay separate even when several containers map their base dirs to the same host directory.
 
 On startup, if no explicit `--cursor` was passed, the archiver reads this file and resumes from that timestamp. Because the cursor is written from the *post-flush* side, a crash (kill -9, OOM, container restart) replays at most one disk-batch window (~10s) — Jetstream serves the replay and downstream dedup on `time_us` collapses it.
 

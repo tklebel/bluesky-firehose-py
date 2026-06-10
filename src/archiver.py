@@ -115,14 +115,15 @@ class BlueskyArchiver:
         self.archive_all = archive_all
         self.archive_non_posts = archive_non_posts
 
-        # Per-mode cursor file: each mode writes to its own base dir, so
-        # each gets its own resume cursor and they don't clobber each other.
+        # Per-mode cursor file: the filename (not just the base dir) encodes
+        # the mode, so cursors stay separate even when multiple containers
+        # map their base dirs to the same host directory.
         if archive_all:
-            self.cursor_file = "data_everything/.cursor"
+            self.cursor_file = "data_everything/.cursor_everything"
         elif archive_non_posts:
-            self.cursor_file = "data_non_posts/.cursor"
+            self.cursor_file = "data_non_posts/.cursor_non_posts"
         else:
-            self.cursor_file = "data/.cursor"
+            self.cursor_file = "data/.cursor_posts"
         self._last_persisted_cursor: Optional[int] = None
 
         # Auto-resume: if no explicit --cursor was passed, try to pick up
