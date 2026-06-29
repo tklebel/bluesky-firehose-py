@@ -22,6 +22,27 @@ _ZSTD_CCTX = _zstd.ZstdCompressor(level=6)
 DISK_BATCH_MAX_RECORDS = 5000
 DISK_BATCH_WINDOW_S = 10.0
 
+# Stall watchdog. The `websockets` ping/pong keepalive catches a dead TCP
+# connection, but NOT a server that holds the socket open, answers pings,
+# and sends zero data events — `async for message` then blocks forever (the
+# 2026-06-11 relay-freeze failure mode, in Jetstream form). The watchdog
+# tracks the time of the last received message; after STALL_WARN_S it warns,
+# and after STALL_RESTART_S it closes the socket to break the wedged
+# `async for`, tripping the existing ConnectionClosed reconnect from the
+# persisted cursor.
+WATCHDOG_TICK_S = 30.0
+STALL_WARN_S = 600.0
+STALL_RESTART_S = 1800.0
+
+# websockets ping keepalive (explicit so TCP-dead detection is well defined
+# and not dependent on the library's default).
+WS_PING_INTERVAL_S = 20.0
+WS_PING_TIMEOUT_S = 20.0
+
+# Heartbeat so the container log shows steady liveness keyed to records
+# actually written, independent of the noisier --measure-rate output.
+PROGRESS_LOG_INTERVAL_S = 900.0
+
 
 async def _append_zst(path: str, lines: List[str]) -> None:
     """Append a batch of JSONL lines to ``path`` as a single zstd frame.
@@ -104,6 +125,12 @@ class BlueskyArchiver:
         self.disk_task: asyncio.Task = None
         self.handle_task: asyncio.Task = None
         self.websocket_task: asyncio.Task = None
+        self.watchdog_task: asyncio.Task = None
+
+        # Watchdog state: the live websocket (so the watchdog can close a
+        # wedged one) and the monotonic time of the last received message.
+        self._ws = None
+        self._last_msg_monotonic: Optional[float] = None
 
         # Set up logging
         logging.basicConfig(
@@ -374,6 +401,7 @@ class BlueskyArchiver:
         else:
             wanted_collections = ["app.bsky.feed.post"]
 
+        loop = asyncio.get_event_loop()
         while self.running:
             try:
                 query_parts = [f"wantedCollections={c}" for c in wanted_collections]
@@ -384,12 +412,21 @@ class BlueskyArchiver:
 
                 url = f"{self.uri}?{'&'.join(query_parts)}"
 
-                async with websockets.connect(url) as archive_websocket:
+                async with websockets.connect(
+                    url,
+                    ping_interval=WS_PING_INTERVAL_S,
+                    ping_timeout=WS_PING_TIMEOUT_S,
+                ) as archive_websocket:
                     if self.debug:
                         logging.debug("🟢 Connected to firehose for archiving")
+                    # Expose the socket so the watchdog can close a wedged
+                    # one, and (re)arm the stall timer on each connect.
+                    self._ws = archive_websocket
+                    self._last_msg_monotonic = loop.time()
                     async for message in archive_websocket:
                         if not self.running:
                             break
+                        self._last_msg_monotonic = loop.time()
                         data = json.loads(message)
 
                         # Advance in-memory cursor for in-process reconnects.
@@ -473,15 +510,70 @@ class BlueskyArchiver:
                     )
                     await asyncio.sleep(5)
 
+    async def _watchdog(self) -> None:
+        """Surface and break silent stalls the ping keepalive can't catch.
+
+        A server that keeps the socket open and answers pings but sends no
+        data events leaves `async for message` blocked forever. We can't
+        tell that apart from a genuinely quiet stream, so first warn
+        (visible in `docker logs`), then close the socket — the listener's
+        ConnectionClosed handler reconnects from the persisted cursor, so
+        the action is always safe, merely redundant if the network was
+        just quiet. Also emits a periodic heartbeat keyed to records
+        written so the log shows liveness instead of silence.
+        """
+        loop = asyncio.get_event_loop()
+        last_warn = 0.0
+        last_progress_log = loop.time()
+        last_progress_count = self.posts_saved
+        while self.running:
+            await asyncio.sleep(WATCHDOG_TICK_S)
+            now = loop.time()
+
+            if now - last_progress_log >= PROGRESS_LOG_INTERVAL_S:
+                delta = self.posts_saved - last_progress_count
+                if delta:
+                    logging.info(
+                        f"Progress: {self.posts_saved:,} records this run "
+                        f"(+{delta:,}), cursor {self.cursor}"
+                    )
+                last_progress_count = self.posts_saved
+                last_progress_log = now
+
+            if self._last_msg_monotonic is None:
+                continue
+            silence = now - self._last_msg_monotonic
+            if silence >= STALL_RESTART_S and self._ws is not None:
+                logging.error(
+                    f"🔴 No Jetstream messages for {silence:.0f}s "
+                    f"(cursor {self.cursor}); closing socket to force reconnect"
+                )
+                # Re-arm before closing so we don't re-fire every tick
+                # during the reconnect/replay window.
+                self._last_msg_monotonic = now
+                try:
+                    await self._ws.close()
+                except Exception as e:
+                    logging.warning(f"Watchdog socket close failed: {e}")
+            elif silence >= STALL_WARN_S and now - last_warn >= STALL_WARN_S:
+                logging.warning(
+                    f"⚠️ No Jetstream messages for {silence:.0f}s "
+                    f"(cursor {self.cursor}) — quiet network or stalled server"
+                )
+                last_warn = now
+
     async def archive_posts(self):
         """Start archiving posts with continuous WebSocket listening."""
         # Start background tasks
         self.websocket_task = asyncio.create_task(self.archive_websocket_listener())
         self.handle_task = asyncio.create_task(self.handle_processor())
         self.disk_task = asyncio.create_task(self.disk_worker())
+        self.watchdog_task = asyncio.create_task(self._watchdog())
 
         # Wait for background tasks to complete
-        await asyncio.gather(self.websocket_task, self.handle_task, self.disk_task)
+        await asyncio.gather(
+            self.websocket_task, self.handle_task, self.disk_task, self.watchdog_task
+        )
 
     async def cleanup(self):
         """Clean up background tasks."""
@@ -530,7 +622,12 @@ class BlueskyArchiver:
             logging.info(f"Saved {remaining_posts} remaining posts during shutdown")
 
         tasks = []
-        for task in [self.websocket_task, self.disk_task, self.handle_task]:
+        for task in [
+            self.websocket_task,
+            self.disk_task,
+            self.handle_task,
+            self.watchdog_task,
+        ]:
             if task and not task.done():
                 task.cancel()
                 tasks.append(task)

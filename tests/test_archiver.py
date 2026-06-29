@@ -5,7 +5,84 @@ import sys
 # Add the parent directory to Python path to find the src module
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from src import archiver as av
 from src.archiver import BlueskyArchiver
+
+
+# ---------------------------------------------------------------------------
+# Stall watchdog
+# ---------------------------------------------------------------------------
+
+class _FakeWS:
+    """Minimal stand-in for a websockets connection the watchdog may close."""
+
+    def __init__(self):
+        self.closed = False
+
+    async def close(self):
+        self.closed = True
+
+
+async def _drain(task):
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+def test_watchdog_closes_socket_on_stall():
+    """No messages past STALL_RESTART_S → watchdog closes the wedged socket."""
+    async def inner():
+        a = BlueskyArchiver(archive_all=True)
+        a.running = True
+        loop = asyncio.get_event_loop()
+        ws = _FakeWS()
+        a._ws = ws
+        a._last_msg_monotonic = loop.time() - 1.0  # "long ago" vs tiny threshold
+
+        orig = (av.WATCHDOG_TICK_S, av.STALL_WARN_S, av.STALL_RESTART_S)
+        av.WATCHDOG_TICK_S, av.STALL_WARN_S, av.STALL_RESTART_S = 0.01, 0.2, 0.5
+        try:
+            wd = asyncio.create_task(a._watchdog())
+            for _ in range(200):  # up to ~2s for the watchdog to fire
+                if ws.closed:
+                    break
+                await asyncio.sleep(0.01)
+            a.running = False
+            await _drain(wd)
+        finally:
+            av.WATCHDOG_TICK_S, av.STALL_WARN_S, av.STALL_RESTART_S = orig
+
+        assert ws.closed is True
+
+    asyncio.run(inner())
+
+
+def test_watchdog_leaves_live_socket_alone():
+    """While messages keep arriving the watchdog must never close the socket."""
+    async def inner():
+        a = BlueskyArchiver(archive_all=True)
+        a.running = True
+        loop = asyncio.get_event_loop()
+        ws = _FakeWS()
+        a._ws = ws
+
+        orig = (av.WATCHDOG_TICK_S, av.STALL_WARN_S, av.STALL_RESTART_S)
+        av.WATCHDOG_TICK_S, av.STALL_WARN_S, av.STALL_RESTART_S = 0.01, 0.2, 0.5
+        try:
+            wd = asyncio.create_task(a._watchdog())
+            for _ in range(80):  # ~0.8s of steady "traffic", > STALL_RESTART_S
+                a._last_msg_monotonic = loop.time()
+                await asyncio.sleep(0.01)
+            a.running = False
+            await _drain(wd)
+        finally:
+            av.WATCHDOG_TICK_S, av.STALL_WARN_S, av.STALL_RESTART_S = orig
+
+        assert ws.closed is False
+
+    asyncio.run(inner())
 
 async def test_stream_posts():
     """Test that stream_posts yields valid post records."""
