@@ -31,6 +31,9 @@ ENV/
 *.swp
 *.swo
 
+# Docker Compose local overrides
+docker-compose.override.yml
+
 # Project specific
 *.log
 data/
