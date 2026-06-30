@@ -526,41 +526,44 @@ class BlueskyArchiver:
         last_warn = 0.0
         last_progress_log = loop.time()
         last_progress_count = self.posts_saved
-        while self.running:
-            await asyncio.sleep(WATCHDOG_TICK_S)
-            now = loop.time()
+        try:
+            while self.running:
+                await asyncio.sleep(WATCHDOG_TICK_S)
+                now = loop.time()
 
-            if now - last_progress_log >= PROGRESS_LOG_INTERVAL_S:
-                delta = self.posts_saved - last_progress_count
-                if delta:
-                    logging.info(
-                        f"Progress: {self.posts_saved:,} records this run "
-                        f"(+{delta:,}), cursor {self.cursor}"
+                if now - last_progress_log >= PROGRESS_LOG_INTERVAL_S:
+                    delta = self.posts_saved - last_progress_count
+                    if delta:
+                        logging.info(
+                            f"Progress: {self.posts_saved:,} records this run "
+                            f"(+{delta:,}), cursor {self.cursor}"
+                        )
+                    last_progress_count = self.posts_saved
+                    last_progress_log = now
+
+                if self._last_msg_monotonic is None:
+                    continue
+                silence = now - self._last_msg_monotonic
+                if silence >= STALL_RESTART_S and self._ws is not None:
+                    logging.error(
+                        f"🔴 No Jetstream messages for {silence:.0f}s "
+                        f"(cursor {self.cursor}); closing socket to force reconnect"
                     )
-                last_progress_count = self.posts_saved
-                last_progress_log = now
-
-            if self._last_msg_monotonic is None:
-                continue
-            silence = now - self._last_msg_monotonic
-            if silence >= STALL_RESTART_S and self._ws is not None:
-                logging.error(
-                    f"🔴 No Jetstream messages for {silence:.0f}s "
-                    f"(cursor {self.cursor}); closing socket to force reconnect"
-                )
-                # Re-arm before closing so we don't re-fire every tick
-                # during the reconnect/replay window.
-                self._last_msg_monotonic = now
-                try:
-                    await self._ws.close()
-                except Exception as e:
-                    logging.warning(f"Watchdog socket close failed: {e}")
-            elif silence >= STALL_WARN_S and now - last_warn >= STALL_WARN_S:
-                logging.warning(
-                    f"⚠️ No Jetstream messages for {silence:.0f}s "
-                    f"(cursor {self.cursor}) — quiet network or stalled server"
-                )
-                last_warn = now
+                    # Re-arm before closing so we don't re-fire every tick
+                    # during the reconnect/replay window.
+                    self._last_msg_monotonic = now
+                    try:
+                        await self._ws.close()
+                    except Exception as e:
+                        logging.warning(f"Watchdog socket close failed: {e}")
+                elif silence >= STALL_WARN_S and now - last_warn >= STALL_WARN_S:
+                    logging.warning(
+                        f"⚠️ No Jetstream messages for {silence:.0f}s "
+                        f"(cursor {self.cursor}) — quiet network or stalled server"
+                    )
+                    last_warn = now
+        except asyncio.CancelledError:
+            pass  # Exit cleanly on cancellation, like the other gathered tasks
 
     async def archive_posts(self):
         """Start archiving posts with continuous WebSocket listening."""
