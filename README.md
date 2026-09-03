@@ -63,6 +63,26 @@ docker-compose up
 docker-compose up -d
 ```
 
+#### Surviving reboots when the data disk mounts late
+
+Docker applies `restart: unless-stopped` exactly **once**, when the daemon starts. If the
+bind-mount source (e.g. a `/data/...` volume mounted with `nofail`, or NFS) is not mounted
+yet at that moment, the start fails with `error while creating mount source path ... permission
+denied`, the container stays `Exited (255)` and Docker never retries. The archiver is then
+silently down until someone notices; Jetstream's replay backlog is only ~24-36 h, so anything
+older than that is lost.
+
+Two host-level guards avoid this (rootless Docker, user systemd units, no root needed):
+
+1. A drop-in for `docker.service` with an `ExecStartPre=` script that waits until the data
+   path exists before `dockerd` starts.
+2. A systemd timer (every 10 min) running a script that `docker start`s every exited container
+   whose restart policy is `always`/`unless-stopped` and whose `State.Error` is non-empty, i.e.
+   exactly the containers whose Docker-managed restart failed. It never creates or recreates
+   containers and ignores containers that were stopped on purpose.
+
+Check both with `systemctl --user cat docker` and `systemctl --user list-timers`.
+
 ## Usage
 
 ### Command Line Interface
