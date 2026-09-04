@@ -1,5 +1,11 @@
 # Bluesky Firehose Archiver
 
+> **Deployment moved (2026-09).** Our production deployment of this archiver (hosts `data` and
+> `medea`, Bluesky posts / non-posts / everything, W social and Eurosky rosters) now lives in the
+> `at-proto-scraper` repository on the group's GitLab, which grew out of this code base and carries
+> the merged history of both hosts. This GitHub repository stays as the public copy of the archiver
+> library and receives no further deployment-specific commits.
+
 A Python library for collecting and archiving posts from the Bluesky social network using the [Jetstream API](https://github.com/bluesky-social/jetstream). This tool connects to Bluesky's firehose and saves posts in an organized file structure.
 
 ## Features
